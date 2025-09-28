@@ -1,0 +1,81 @@
+services:
+  vk-tunnel:
+    image: node:20-alpine
+    container_name: vk-tunnel
+    restart: unless-stopped
+    environment:
+      PROXY_HOST: ${TARGET_HOST}
+      PROXY_PORT: ${TARGET_PORT}
+      PROXY_HTTP_PROTO: ${TUNNEL_HTTP_PROTO:-https}
+      PROXY_WS_PROTO: ${TUNNEL_WS_PROTO:-wss}
+      PROXY_TIMEOUT: ${TUNNEL_TIMEOUT:-5000}
+      NODE_TLS_REJECT_UNAUTHORIZED: ${TUNNEL_INSECURE:-0}
+    volumes:
+      # токен vk-tunnel будет лежать в /home/node/.config/configstore
+      - vk_config:/home/node/.config/configstore
+      - shared:/shared
+    command: |
+      sh -c 'npm i -g @vkontakte/vk-tunnel && \
+            vk-tunnel \
+              --http-protocol=$${PROXY_HTTP_PROTO} \
+              --ws-protocol=$${PROXY_WS_PROTO} \
+              --host=$${PROXY_HOST} \
+              --port=$${PROXY_PORT} \
+              --timeout=$${PROXY_TIMEOUT} \
+            2>&1 | tee -a /shared/tunnel.log'
+    networks:
+      - proxy-net
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qE 'https?://.+vk-apps\\.com' /shared/tunnel.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  tunnel-watcher:
+    image: python:3.12-alpine
+    container_name: tunnel-watcher
+    restart: unless-stopped
+    depends_on:
+      - vk-tunnel
+    volumes:
+      - shared:/shared
+      - ./watcher.py:/app/watcher.py:ro
+    command: python -u /app/watcher.py
+    networks:
+      - proxy-net
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /shared/current_url"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  tunnel-relay:
+    image: openresty/openresty:alpine
+    container_name: tunnel-relay
+    restart: unless-stopped
+    depends_on:
+      - tunnel-watcher
+    volumes:
+      - shared:/shared
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+    networks:
+      - proxy-net
+    # если NPM не в этой сети — откройте порт:
+    # ports:
+    #   - "18080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/__upstream | grep -q vk-apps.com"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  vk_config: {}
+  shared: {}
+
+networks:
+  proxy-net:
+    external: true
